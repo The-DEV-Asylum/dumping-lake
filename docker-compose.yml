@@ -1,0 +1,96 @@
+services:
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dumping
+      POSTGRES_USER: dumping
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dumping -d dumping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ingest:
+    build:
+      context: ./ingest
+    environment:
+      DATABASE_URL: postgresql://dumping:${POSTGRES_PASSWORD}@postgres:5432/dumping
+      DATA_ROOT: /data
+      INGEST_SOURCE: ${INGEST_SOURCE:-local}
+      INGEST_ROOT: ${INGEST_ROOT:-/source}
+    volumes:
+      - ./data:/data
+      - ${HOST_INGEST_ROOT:?HOST_INGEST_ROOT is required}:/source:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  opensearch:
+    image: opensearchproject/opensearch:3.8.0
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms2g -Xmx2g"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    ports:
+      - "127.0.0.1:9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  indexer:
+    build:
+      context: ./indexer
+    environment:
+      DATABASE_URL: postgresql://dumping:${POSTGRES_PASSWORD}@postgres:5432/dumping
+      OPENSEARCH_URL: http://opensearch:9200
+      OPENSEARCH_INDEX: objects
+      OPENSEARCH_CONTENT_INDEX: object-content
+      DATA_ROOT: /data
+      EXTRACTED_ROOT: /data/extracted
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+
+  extractor:
+    build:
+      context: ./extractor
+    environment:
+      DATABASE_URL: postgresql://dumping:${POSTGRES_PASSWORD}@postgres:5432/dumping
+      DATA_ROOT: /data
+      EXTRACTED_ROOT: /data/extracted
+      EXTRACT_CHUNK_BYTES: ${EXTRACT_CHUNK_BYTES:-16777216}
+      EXTRACTOR_VERSION: ${EXTRACTOR_VERSION:-2}
+    volumes:
+      - ./data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  opensearch_data:
