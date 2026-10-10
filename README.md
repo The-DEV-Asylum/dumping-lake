@@ -1,256 +1,185 @@
 # dumping-lake
+![](.github/dev-asylum-dumping-lake.png)
 
-`dumping-lake` is a local, content-addressed research corpus built for heterogeneous security datasets: 
-SQL dumps, leaked databases, documents, images, archives, source code, logs, reports, and whatever 
-other evidence humanity decided was a good idea to leave lying around.
+**A local, content-addressed research corpus for piles of files that have outgrown human memory.**
 
-The basic philosophy is simple:
+Part evidence catalogue, part extraction pipeline, part search engine. It preserves original bytes, records where each copy came from, extracts text into rebuildable derivatives, and makes the resulting corpus searchable. Because apparently "put it in a folder and remember the filename" does not scale to several terabytes.
 
-> Keep the original data.
-> Know exactly what it is.
-> Don't lose track of where it came from.
-> Make it searchable without destroying it.
+> **The DEV Asylum rule:** the idea can be ridiculous. The implementation cannot.
 
-Because apparently that's difficult. Especially if you have Terabytes of stuff on an old USB hard drive behind a Pi.
+## The Asylum verdict
+
+- **Does it work?** The repository contains a runnable multi-service pipeline. Validate it on your own data and environment using the checklist in [`docs/engineering-notes.md`](docs/engineering-notes.md) before calling a deployment tested.
+- **Is it useful?** If you have a large, heterogeneous local research corpus, potentially. If you have three PDFs, a folder is still winning.
+- **What does it teach?** Content-addressed storage, idempotent ingestion, provenance, database modelling, restartable pipelines, bounded text chunking, search indexing, and the art of making several containers agree on what "done" means.
 
 ## What it does
 
-`dumping-lake` takes a pile of files and turns it into a searchable research corpus.
+`dumping-lake` takes files from a configured local source and builds a searchable catalogue without rewriting the originals.
 
 ```text
-Source filesystem
-       │
-       V
-    Ingest
-       │
-       ├── SHA-256
-       ├── deduplication
-       ├── metadata
-       └── immutable raw storage
-                  │
-                  V
-             PostgreSQL
-                  │
-                  ├── object catalogue
-                  ├── source relationships
-                  └── extraction metadata
-                  │
-                  V
-              Extractor
-                  │
-                  └── derived text chunks
-                  │
-                  V
-              OpenSearch
-                  │
-                  ├── metadata search
-                  └── full-text search
+Source filesystem (read-only mount)
+          |
+          v
+       Ingest
+          |  SHA-256, metadata, source relationships
+          v
+  Content-addressed raw store <----> PostgreSQL catalogue
+          |
+          v
+       Extractor
+          |  bounded text chunks, extraction status
+          v
+   Derived text store
+          |
+          v
+       Indexer --------------------> OpenSearch
+                                      | metadata search
+                                      | full-text search
 ```
 
-The important word there is **original**.
-
-The raw bytes are stored separately using their SHA-256 as the object identity.
-
-We don't rewrite evidence because some parser got ambitious.
+The important distinction is between **source files**, **unique byte-identical objects**, and **derived data**. Different paths can refer to the same SHA-256 object. Extracted text and search indexes are derivatives; the original bytes remain the source of truth.
 
 ## Why content addressing?
 
-Because filenames lie. These two:
+Filenames are not identity. `report-final.pdf`, `report-final-v2.pdf`, and `report-really-final.pdf` may be three names for one object, or three different objects with a naming problem.
 
-```text
-customers-final.csv
-customers-final-final.csv
+The ingest stage hashes file contents with SHA-256 and deduplicates storage by bytes. Source-path relationships are retained in the catalogue, so deduplication does not erase provenance. A hash is a practical content identifier, not proof that a file is authentic or trustworthy.
+
+## Pipeline stages
+
+1. **Ingest** recursively walks the configured source, records metadata and source relationships, hashes files, and stores unique raw objects.
+2. **PostgreSQL** tracks objects, source files, ingestion runs/errors, and extraction metadata.
+3. **Extract** processes supported text-capable files separately from ingestion. Large outputs are split into bounded chunks.
+4. **Index** publishes object metadata and extracted text to OpenSearch.
+5. **Search** queries metadata or extracted content.
+
+Keeping stages separate means a parser failure should not require rereading every source file. It also means each stage needs its own observability and recovery story. Containers are not a substitute for those things, despite their excellent ability to look busy.
+
+## Stack
+
+- Python services for ingest, extraction, and indexing
+- PostgreSQL for the catalogue and pipeline state
+- OpenSearch for metadata and full-text search
+- Docker Compose for local orchestration
+- SHA-256 content addressing and compressed extracted text
+
+## Quick start
+
+### 1. Prepare configuration
+
+```bash
+cp .env.example .env
 ```
 
-might be identical.
+Edit `.env` before starting anything. Set `POSTGRES_PASSWORD` to a long, unique random value and set `HOST_INGEST_ROOT` to the directory you intend to ingest. The source is mounted read-only into the ingest container. Keep `.env` out of version control.
 
-Or:
+The sample paths are examples, not magic. Replace `/home/ghost/external-hd` and `/source/Leaks` with paths that exist in your environment.
 
-```text
-report.pdf
-report2.pdf
-copy_of_report.pdf
+### 2. Start the services
+
+```bash
+docker compose config
+docker compose up --build -d
 ```
 
-might all contain the same bytes.
+Check service state and logs:
 
-`dumping-lake` hashes the file and stores one object per unique SHA-256.
-
-So:
-
-```text
-17,000 files
-     |
-     V
-16,700 unique objects
+```bash
+docker compose ps
+docker compose logs --tail=100
 ```
 
-The duplicates still exist in the catalogue as source relationships.
-Nothing gets forgotten just because the bytes are identical.
+### 3. Run the pipeline stages
 
-## Storage model
+Use the repository scripts as the intended entry points:
 
-Raw objects live under:
-
-```text
-data/raw/
+```bash
+./scripts/ingest.sh
+./scripts/extract.sh
+./scripts/search-index.sh
 ```
 
-They are content-addressed and never indexed directly into OpenSearch.
-PostgreSQL stores the catalogue:
+The exact runtime and command options are defined in the scripts and service entry points. Check their output and exit status at each stage rather than assuming that a running container means the corpus is fully indexed. It means the container is running. We have not yet solved observability by wishful thinking.
 
-```text
-objects
-source_files
-ingestion_runs
-ingestion_errors
-object_extractions
-object_extraction_chunks
-extraction_runs
-```
+### 4. Search
 
-Derived text is stored separately from the raw corpus.
-
-Because **your evidence is the evidence**.
-
-## Search
-
-Metadata search:
+Search indexed metadata:
 
 ```bash
 ./scripts/search-index.sh search credential
 ```
 
-Full-text search:
+Search extracted text:
 
 ```bash
 ./scripts/search-index.sh content-search "phone number"
 ```
 
-The second command searches extracted content rather than filenames.
+Search results depend on which stages have completed and which file types the extractor supports.
 
-That distinction becomes fairly important when the file is called:
+## Storage layout
 
 ```text
-1614851577835_19090_5e8155cce111a991bf45c2830c7c81be_2.jpg
+data/
+├── raw/        # original, content-addressed objects
+├── staging/    # temporary pipeline work
+├── extracted/  # derived, compressed text chunks
+└── parquet/    # reserved for future analytical outputs
 ```
 
-and the interesting thing inside it is your ex phone number you like to drunk call.
-
-## Extraction
-
-Extraction is deliberately separate from ingestion.
-That means a broken PDF parser doesn't get to break your corpus.
-
-Text-capable files are extracted into compressed chunks.
-Large files are split into bounded pieces instead of becoming one gigantic OpenSearch document.
-
-This is especially useful for:
-
-* SQL dumps
-* CSV exports
-* logs
-* source trees
-* large text files
-* documents containing enormous tables
-
-Images are currently catalogued but not automatically OCR'd.
-That's coming later.
-Recognizing text in pictures without killing resource quite a challenge nowdays.
+`data/` is deliberately excluded from source control. Treat it as potentially sensitive research material, not a sample-data directory to casually attach to an issue.
 
 ## Design principles
 
-### Raw data is immutable
+### Preserve originals
+Raw bytes are the source of truth. Extraction and indexing must not rewrite them.
 
-The raw object is the source of truth.
-Derived data can be deleted and rebuilt.
+### Track provenance
+A content hash identifies bytes; source records describe where those bytes were found. Keep those concepts separate.
 
-### Metadata is separate from content
+### Make derivatives rebuildable
+Search indexes and extracted text can be regenerated from source objects. Recovery should be a documented operation, not a late-night archaeological expedition.
 
-PostgreSQL is the catalogue.
-OpenSearch is the search layer.
-Neither one is the raw-data store.
+### Bound resource use
+Large text files are chunked rather than turned into a single enormous search document. Large corpora still need disk, memory, and time budgets; "local" is not another word for "free."
 
-### Everything is restartable
+### Prefer repeatable stages
+Ingest, extract, and index independently. Failures should be visible and recoverable without corrupting the original corpus.
 
-Ingestion, extraction, and indexing are separate stages.
-A failure in one should not require starting over from the beginning.
+## Current scope
 
-### Deduplication is by bytes
+The repository implements recursive ingestion, SHA-256 deduplication, source-to-object relationships, ingestion error tracking, text extraction, chunked derived text, metadata indexing, full-text indexing, and command-line search.
 
-Not by filename.
-Not by extension.
-Not by "looks similar."
+Not currently implemented as part of the standard pipeline: automatic OCR, archive-aware recursive extraction, advanced entity/relationship extraction, and local LLM/RAG. Those are future experiments, not features you should infer from a roadmap.
 
-By SHA-256.
+## Security, privacy, and legal boundaries
 
-### Local first
+This tool is intended for datasets you are authorised to possess and analyse. A security-research label does not make stolen, personal, or restricted data lawful to collect or redistribute.
 
-This project is intended to run on your own hardware.
+- **Keep it local.** The Compose file binds PostgreSQL and OpenSearch ports to loopback, but OpenSearch security is disabled in the supplied configuration. Do not change those bindings to `0.0.0.0` or expose the services to an untrusted network.
+- **Protect the corpus.** Restrict filesystem permissions, encrypt disks where appropriate, and keep backups access-controlled. Hashing is not encryption.
+- **Keep secrets out of Git.** Use `.env` locally; commit only `.env.example` with placeholder values.
+- **Minimise sensitive data.** Ingest only what you have a lawful basis to handle. Plan retention and deletion, and remember that extracted text and search indexes can contain the same sensitive information as the originals.
+- **Treat files as hostile input.** Parsers can be buggy, malformed files can consume resources, and extracted text can contain secrets. Run with least privilege and test on disposable copies first.
+- **Do not publish corpus data.** Never commit `data/`, real datasets, credentials, or logs containing personal information.
 
-No SaaS account required.
-No subscription.
-No mysterious API bill appearing because somebody searched for "password."
+This is a research pipeline, not a certified evidence-management platform or production security boundary. Threat-model your own deployment before relying on it for sensitive investigations.
 
-## Current stack
+## Testing and known limitations
 
-* Python
-* PostgreSQL
-* OpenSearch
-* Docker Compose
-* SHA-256 content addressing
-* compressed derived text
-* `opensearch-py`
-* `psycopg`
+The repository includes a manual validation checklist in [`docs/engineering-notes.md`](docs/engineering-notes.md). It covers idempotency, deduplication, failure handling, extraction chunking, indexing, search, and local-only exposure. Record actual outcomes in your release notes. A test plan is not a test result, no matter how confident the Markdown looks.
 
-## Current status
+File-type support and extraction quality depend on the installed libraries and input. OpenSearch is a derived index and can be rebuilt, but index refreshes and bulk operations can still fail partway through. Large corpora need monitoring for disk consumption, memory pressure, slow parsers, and incomplete jobs.
 
-The pipeline currently supports:
+## Contributing
 
-* recursive ingestion
-* SHA-256 deduplication
-* source-to-object relationships
-* filesystem error tracking
-* restart-safe ingestion
-* metadata indexing
-* text extraction
-* chunked derived text
-* full-text indexing
-* metadata search
-* content search
-
-Planned work includes:
-
-* OCR
-* archive-aware extraction
-* richer file-type support
-* Parquet/DuckDB analytics
-* entity extraction
-* relationships between datasets
-* local LLM/RAG
-* better search ranking
-
-## Important warning
-
-This project is designed for research data.
-
-That means the data may be sensitive, illegal to redistribute, dangerous to handle, or just generally the sort of thing 
-you don't want uploaded to GitHub.
-
-Do not expose the raw corpus through Docker ports.
-Do not commit `data/`.
-Do not put your `.env` in Git.
-Do not assume that because you can access a dataset, you are legally allowed to publish it.
-The computer is not your lawyer.
-
-Neither am I.
+Small, reviewable changes are preferred. Explain the failure mode or technical question, include reproducible steps, test the affected stage, and document limitations. Please do not include real sensitive data in issues, logs, fixtures, or screenshots. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 
-See `LICENSE`.
+See [`LICENSE`](LICENSE).
 
-Use responsibly.
-Preferably with backups.
-Preferably with a working filesystem.
+---
 
-I've seen what happens when researchers skip the backups.
+**Does it work?** Test the pipeline. **Is it overkill?** Almost certainly. **Did we learn something?** That's the point.
